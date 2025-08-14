@@ -1,0 +1,640 @@
+---
+title: "Analysis of influencing factors for force use in New York City’s Stop, Question, and Frisk"
+output: 
+  html_document:
+    
+    toc: true
+    fig_caption: yes
+    number_sections: yes
+highlight: monokai
+code_folding: show
+author:
+  - Yu Liang, Wenzheng Yin, Haiyang Lu
+date: "2023-10-18"
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+# Exploratory part
+
+```{r message=FALSE, warning=FALSE, cache=TRUE, include=FALSE}
+# Load necessary packages
+library(nnet)
+library(mice)
+library(lattice)
+library(ggplot2)
+library(gridExtra)
+library(splines)
+library(dplyr)
+library(latticeExtra) # for binnedplot
+library(arm)
+library(pROC)
+# load the dataset
+load("D:/Users/10567/Desktop/regression/big assignment/sqf_fryer_2003_2013.Rdata")
+```
+
+```{r cache=FALSE}
+summary(d2)
+```
+
+From the summary, we can see that the data types of many variables are inconsistent with their actual meanings, so firstly we change them.
+
+```{r echo=FALSE, cache=TRUE}
+# change the data type
+d2$force <- as.factor(d2$force)
+d2$gender <- as.factor(d2$gender)
+d2$age2 <- as.integer(d2$age2)
+d2$daytime <- as.factor(d2$daytime)
+d2$inout2 <- as.factor(d2$inout2)
+d2$offunif2 <- as.factor(d2$offunif2)
+d2$typeofid2 <- as.factor(d2$typeofid2)
+d2$othpers2 <- as.factor(d2$othpers2)
+d2$year <- as.numeric(d2$year)
+# delete the ignorable columns(from the describtion in assignment)
+d2n<-subset(d2,select = -c(force2,pct))
+summary(d2n)
+```
+
+From the summary, we can see that: 1, There are 8 variables including NA values: race2, gender, age2, daytime, inout2, offunif2, typeofid2, othpers2.
+2, Apart from **force** and **age2**, other variables can be treated as binary categorical variables.
+
+## Density plot for different variables
+
+```{r echo=FALSE, cache=TRUE}
+plot1<-list()
+d2n_classVariable <- subset(d2n,select = -c(age2,year))
+column_names <- colnames(d2n_classVariable)
+for (j in 1:20) {
+  name <- column_names [j]
+  result <- data.frame(table(d2n_classVariable[, j],useNA = "ifany"))
+  result$percentage <- (result$Freq / sum(result$Freq))
+  
+  df <- data.frame(x = result$Var1, y = result$percentage)
+  plot1[[j]] <- ggplot(data = df, mapping = aes(x = x, y = y)) +
+    geom_bar(stat = 'identity',na.rm = FALSE)+
+    xlab(name)+ylab("Percentage")
+  
+}
+
+#age
+x_labels <- c("10", "30", "50", "70", "90", NA)
+d2n_age2<-d2n[,4]
+result <- data.frame(table(d2n_age2,useNA = "ifany"))
+result$percentage <- (result$Freq / sum(result$Freq))
+df <- data.frame(x = result$d2n_age2, y = result$percentage)
+plot1[[21]] <- ggplot(data = df, mapping = aes(x = x, y = y)) +
+  geom_bar(stat = 'identity', na.rm = FALSE) +
+  scale_x_discrete(breaks = x_labels, labels = x_labels) +
+  xlab("age2") + ylab("Percentage")
+   
+grid.arrange(grobs = plot1, ncol = 5,norw=4)
+```
+
+From the bar and density plots, we get below information for different variables,
+
+1.  For force: In most cases, the police didn't use force in a stop and frisk interaction.
+    The total number of remaining samples being used different types of force only accounts for a small portion.
+    Therefore, we decide to focus on the problem **if** the police will use force in different situations.
+    Specifically, we will consider the force taking values from 1\~7 as the same value 1, representing that force has been used.
+
+2.  For variables related with personal information including race2, gender and age2: From the bar and density plots, we can notice that the civilian investigated are not evenly distributed based on the above information.
+    For example, the black, the male or the pedestrians aged around 20 take up a larger proportion than others.
+    What' more, these 3 variables exhibit an obvious skewed distribution but it's reasonable since all the samples in the dataset are "stopped" and not generated from random sampling.
+
+3.  For variables starting with 'cs': They describes Civilians' suspicious behaviors.
+    And most of these variables take the value of "N".
+    Since the accumulated number of "Y" in these variables can reflect the civilian's **suspicion level**, we want to establish a new feature so that all of this information can be aggregated.
+    Specifically, we will create a new variable **cs** whose value is the accumulated number of "Y" in these 10 "cs-"starting variables.
+    Obviously the larger **cs** is, the more suspicious we consider the civilian to be.
+    By creating **cs**, we ignore the specific suspicious behavior while retaining a measure of its level of suspicion, which can reduce noise in our subsequent analysis.
+
+4.  A remarkable variable is **daytime**, the missing data percentage of which is 13% and is much larger than any other variable.
+    In addition, another variable "ac_time" also includes the impact of time on force use.
+    So we decide to remove this variable in subsequent analysis.
+
+5.  As for ac-incid and ac-time, there is no missing value.
+    And there is no much difference between the proportion of "N" and "Y" for both.
+
+6.  inouts, offunit2 and otherpers2, all of two variables with little missing data are observed a slight skew.
+
+7.  typeofid2 has four levels, the first three of which can be regarded as the same level: agree to provide ID.
+    Specifically, we will transfer typeofid2 into a binary variable, denoting "R" as "0" and the other three as "1".
+
+8.  As for years, we think it cannot be used for prediction.
+    Because intuitively, the passage of years does not directly affect the force use.
+    Even if there is an impact, it is also indirect (such as through the implementation of some certain policies).
+    Therefore, we won't be able to explain the meaning of its coefficient in the model, nor can we guarantee the explanatory power of the model for future data.
+    As a result we decide to delete this variable before we build the model.
+
+## Handle the missing value: Multiple imputation
+
+### The background of Multiple Interpolation
+
+Multiple imputation typically involves three main steps: 1.
+Imputation: Impute missing values in each dataset.
+Imputation can be done using various methods, such as regression imputation, predictive mean matching, or other imputation models.
+Each imputed dataset represents one possible set of missing data replacements.
+2.
+Analysis: Analyze each imputed dataset separately using the statistical analysis you intend to perform (e.g., regression analysis, hypothesis testing, or data visualization).
+3.
+Pooling: Combine the results from each imputed dataset to obtain a single set of parameter estimates and standard errors.
+This is typically done using Rubin's rules, which take into account both within-imputation variability and between-imputation variability.
+
+But since this dataset is too large and pooling will be very computationally expensive so we only analysis on one imputed dataset.
+
+In order to achieve better results in multiple imputation, we hope to utilize the relationships between various variables as much as possible.
+Therefore we aim to exclude situations where missing values center at one specific case.
+We draw the cross tabulation of 2 variables to achieve this objective.
+Take race2 and gender for example.
+
+```{r echo=FALSE}
+table(d2n$race2, is.na(d2n$gender)) # why we can impute the data
+```
+
+There is no abnormality displayed in the table.
+
+What's more we can draw the missing data pattern.
+
+```{r echo=FALSE, cache = TRUE}
+missing_data_pattern<- md.pattern(d2,rotate.names=TRUE)
+```
+
+From this plot we can see that although sometimes multiple variables are missing together, there are no dominant patterns.
+
+```{r echo=FALSE, cache = TRUE}
+set.seed(123)
+
+# Perform imputation
+# mice_data <- mice(d2n, m = 1)
+
+# In order to shorten the time required for .rmd to generate documents, we stored the "mice_data" after multiple imputations
+load("D:/Users/10567/Desktop/regression/big assignment/mice_original.Rdata")
+# Export imputed data
+imputed_data <- complete(mice_data,1) #mice_data is mice(d2n, m = 1)
+```
+
+### Multiple imputation diagnostics
+
+We do the imputation with mice() and we can do diagnostics directly.
+We observe the distribution of **age2** before and after the imputation and it doesn't change much, which implies the quality of the imputed dataset is acceptable.
+We didn't show all the results but they are all similar.
+
+```{r cache = TRUE}
+densityplot(mice_data)
+```
+
+## Feature engineering
+
+From the discussion above, we build new features based on the imputed data.
+
+```{r echo=FALSE, cache = TRUE}
+# build "cs"
+for (i in (ncol(imputed_data) - 10):(ncol(imputed_data)-1)) {
+  imputed_data[,i] <- ifelse(imputed_data[,i] == "Y", 1, ifelse(imputed_data[,i] == "N", 0, imputed_data[,i]))
+}
+imputed_data$cs <- rowSums(imputed_data[, (ncol(imputed_data) - 10):(ncol(imputed_data)-1)])
+
+# change force&typeofid2 into a 0-1 variable
+imputed_data$force <- ifelse(imputed_data$force != 0, 1, 0)
+imputed_data$force <- as.factor(imputed_data$force)
+imputed_data$typeofid2 <- ifelse(imputed_data$typeofid2 == "R",0,1)
+imputed_data$typeofid2 <- as.factor(imputed_data$typeofid2)
+
+#delete the "cs-" starting variables
+imputed_data <- subset(imputed_data,select = -c(cs_objcs, cs_descr, cs_casng, cs_lkout, cs_cloth, cs_drgtr, cs_furtv, cs_vcrim, cs_bulge, cs_other,year,daytime))
+
+summary(imputed_data)
+```
+
+## Force use v.s. single variable
+
+```{r echo=FALSE, cache = TRUE}
+#plot percentage of different force on each category in each variable
+plot2<-list()
+for (i in c(2:11)) {
+    frequency_table <- table(imputed_data[,i], imputed_data[,1])
+    prop_table <- prop.table(frequency_table, margin = 1)
+    df<-as.data.frame(prop_table)
+    
+    plot2[[i-1]]<-ggplot(df, aes(x = Var1, y = Freq, fill = Var2)) +
+      geom_bar(stat = "identity", position = "dodge", color = "black") +
+      labs(x = colnames(imputed_data)[i], y = "Percentage",fill="force") +
+      scale_fill_manual(values = c("skyblue","yellow")) +
+      theme_minimal()
+      
+}
+
+grid.arrange(grobs = c(plot2[1:2],plot2[4:10]), ncol = 3,norw=3)
+print(plot2[[3]]+scale_x_discrete(breaks = seq(10, 80, by = 5)))
+```
+
+From these plot we can form a basic impression on how each variable affect the force.
+
+For example, there is a significant difference in force use in different **race2**, **gender**,...,groups, which implies that these variables maybe strong predictors in our following analysis and shows their specific impact on force use.
+For example, force is used more on gender0 group(male) than gender1 group(female).
+For other variables the analysis is similar.
+
+## Spearman correlation matrix
+
+We draw the correlation plot to explore the potential collinearity between variables.
+
+```{r echo=FALSE, cache = TRUE}
+#Spearman correlation matrix
+cp<-cor(data.matrix(imputed_data),method="spearman")
+ord<-rev(hclust(as.dist(1-abs(cp)))$order)
+colPal<-colorRampPalette(c("blue","yellow"),space="rgb")(100)
+
+p<-levelplot(cp[ord,ord],
+          xlab="",
+          ylab="",
+          col.regions=colPal,
+          at=seq(-1,1,length.out=100),
+          colorkey=list(space="top",labels=list(cex=1.5)),
+          scales=list(x=list(rot=45),
+                      y=list(draw=FALSE),
+                      cex=1.2)
+          )
+print(p)
+```
+
+From the plot we can observe a positive correlation between ac_time and ac_incid but not very strong.
+There is not enough evidence for us to delete any variable in this step.
+
+## Add1(),drop1() and F-test
+
+```{r cache = TRUE}
+form1 <- force~race2 + gender + age2 + inout2 + ac_incid + ac_time + offunif2 + typeofid2 + othpers2 + cs
+
+model_full <- glm(form1,family = binomial(link = "logit"), 
+                  contrasts = list(race2="contr.sum", gender="contr.sum", inout2="contr.sum", ac_incid="contr.sum", ac_time="contr.sum", offunif2="contr.sum", typeofid2="contr.sum", othpers2="contr.sum"),
+                  data=imputed_data)
+
+model_null <- glm(force~1, family = binomial(link = "logit"), data = imputed_data)
+
+AddTermModel<-add1(model_null,model_full, test="LRT")
+DropTermModel<-drop1(model_full, test="LRT")
+
+print(AddTermModel)
+print(DropTermModel)
+```
+
+From the result of F-test, we can say that all the variables included are significant and we should keep them.
+
+# Analysis part
+
+We choose the logit regression model for our study since it's a binary classification problem.
+
+## Model construction
+
+First of all, we will build a *logit_m1* with all variables included.
+
+Intuitively, there may exist a nonlinear effect in **age**.
+Because for too young and too old civilians the police should be less inclined to use force than adult civilians.
+
+What's more, we consider an interaction effect between **ac_incid** and **ac_time**.
+We guess if the stop occurs both in an area of high crime incidence and at a time of day that fit crime incidence, the police may be more alert than usual and be more likely to use force.
+
+We build three more models which consider a nonlinear effect(*logit_md2*), an interaction effect(*logit_m3*), a nonlinear and interaction effect(*logit_md4*).
+
+```{r cache = TRUE}
+# 0-1 response with no interaction & splines
+form1 <- force~race2+gender+age2+inout2+ac_incid+ac_time+offunif2+typeofid2+othpers2+cs
+# 0-1 response with ac_incid*ac_time
+form2 <- force~race2+gender+age2+inout2+ac_incid*ac_time+offunif2+typeofid2+othpers2+cs
+# 0-1 response with splines
+form3 <- force~race2+gender+ns(age2,df=3)+inout2+ac_incid+ac_time+offunif2+typeofid2+othpers2+cs
+# 0-1 response with ac_incid*ac_time & splines
+form4 <- force~race2+gender+ns(age2,df=3)+inout2+ac_incid*ac_time+offunif2+typeofid2+othpers2+cs
+
+# build the logit models  
+logit_md1 <- glm(form1, family = binomial(link=logit), data = imputed_data)
+logit_md2 <- glm(form2, family = binomial(link=logit), data = imputed_data)
+logit_md3 <- glm(form3, family = binomial(link=logit), data = imputed_data)
+logit_md4 <- glm(form4, family = binomial(link=logit), data = imputed_data)
+```
+
+### Anova
+
+```{r cache = TRUE}
+anova(logit_md1, logit_md2, test = "LRT")
+anova(logit_md1, logit_md3, test = "LRT")
+anova(logit_md3, logit_md4, test = "LRT")
+```
+
+From the result of anova, we can say that both interaction and nonlinear effects are worth consideration.
+
+### Explanation of the models
+
+```{r echo=FALSE}
+md_list <- list(logit_md1, logit_md2, logit_md3, logit_md4)
+for (md in md_list) {
+  print(summary(md))
+}
+```
+
+1.  All the variables are significant so their values are meaningful.
+2.  The value of variables represents the way how they influence the probability of being used force when stopped. Take *logit_md1* for example, the coefficient of **gender1** means that when all other variables remain the same, **gender1**(female) is less likely to be used force by a probability of 0.54.
+
+## Model diagnostic
+
+### raw deviance residuals
+
+Take the *logit_md1* for example.
+We plot its deviance/person residuals.
+
+```{r echo=FALSE, warning=FALSE, cache = TRUE}
+forceDiag<-transform(
+  imputed_data,
+  .fitted=predict(logit_md1,type = "response"),
+  .deviance=residuals(logit_md1, type = "deviance"),
+  .pearson=residuals(logit_md1, type = "pearson")
+)
+
+p1<-qplot(.fitted, .deviance,data=forceDiag,geom="hex")+
+  geom_smooth(linewidth=1)+
+  xlab("fitted values")+ylab("deviance residuals")
+p2<-qplot(.fitted,.pearson,data=forceDiag,geom="hex")+
+  geom_smooth(linewidth=1)+
+  xlab("fitted values")+ylab("pearson residuals")
+
+grid.arrange(p1,p2,ncol=2)
+
+```
+
+In this plot, we get two curves for both kinds of residuals.
+It's because the "force2" is a binary variable and consequently for any fitted response there are only 2 values for the deviance.
+As a result, this raw residual plot do not exhibit the same pattern and could not be used to test homoscedasticity which we might expect in linear regression model's residual plot.
+
+### binned residual
+
+A binned residual plot is a graphical method for assessing the goodness of fit and the distribution of residuals in a regression model, especially when dealing with a large number of data points.
+It is commonly used in linear regression and generalized linear models, including logistic regression.
+
+The binned residual-fitted plot involves the following steps:
+
+1.  Divide the range of fitted values into a series of bins or intervals.
+2.  Calculate the mean(or median) of the residuals for each bin. These are the observed residuals within each bin.
+3.  Plot the observed residuals against the corresponding bin's center or average fitted value. This results in a scatter plot with bins.
+4.  Optionally, overlay reference lines, such as a horizontal line at 0, to assess the overall distribution of residuals.
+
+#### residual-fitted plot
+
+We use fitting on subsets with 1,500,000 observations to obtain binned residual plots, as the entire dataset exceeded the computational power of binnedplot() and it will cause errors.
+
+This can also reflect our concerns because the subset is generated through random sampling and big enough.
+
+```{r echo=FALSE, cache = TRUE}
+set.seed(123)
+subset_size <- 1500000
+subset_indices <- sample(nrow(imputed_data), subset_size)
+
+subset_md1 <- update(logit_md1, subset = subset_indices)
+subset_md2 <- update(logit_md2, subset = subset_indices)
+subset_md3 <- update(logit_md3, subset = subset_indices)
+subset_md4 <- update(logit_md4, subset = subset_indices)
+
+```
+
+```{r echo=FALSE, cache = TRUE}
+# Create a binned residual plot
+binnedplot(predict(subset_md1,type = "response"), 
+         residuals(subset_md1,type = "response"), 
+         # type = "response" means we take the 0-1 loss
+         nclass = NULL, # let binnedplot() calculate appropriate number of bins itself
+         xlab = "Expected Values", 
+         ylab = "Average residual", 
+         ylim = c(-0.15, 0.15),
+         main = "Binned residual plot (Subset) - logit_md1", 
+         cex.pts = 0.4, 
+         col.pts = 1, 
+         col.int = "gray")
+```
+
+```{r echo=FALSE, cache = TRUE}
+# Create a binned residual plot
+binnedplot(predict(subset_md2,type = "response"), 
+         residuals(subset_md2,type = "response"), 
+         # type = "response" means we take the 0-1 loss
+         nclass = NULL, # let binnedplot() calculate appropriate number of bins itself
+         xlab = "Expected Values", 
+         ylab = "Average residual", 
+         ylim = c(-0.15, 0.15),
+         main = "Binned residual plot (Subset) - logit_md2", 
+         cex.pts = 0.4, 
+         col.pts = 1, 
+         col.int = "gray")
+```
+
+```{r echo=FALSE, cache = TRUE}
+# Create a binned residual plot
+binnedplot(predict(subset_md3,type = "response"), 
+         residuals(subset_md3,type = "response"), 
+         # type = "response" means we take the 0-1 loss
+         nclass = NULL, # let binnedplot() calculate appropriate number of bins itself
+         xlab = "Expected Values", 
+         ylab = "Average residual", 
+         ylim = c(-0.15, 0.15),
+         main = "Binned residual plot (Subset) - logit_md3", 
+         cex.pts = 0.4, 
+         col.pts = 1, 
+         col.int = "gray")
+```
+
+```{r echo=FALSE, cache = TRUE}
+# Create a binned residual plot
+binnedplot(predict(subset_md4,type = "response"), 
+         residuals(subset_md4,type = "response"), 
+         # type = "response" means we take the 0-1 loss
+         nclass = NULL, # let binnedplot() calculate appropriate number of bins itself
+         xlab = "Expected Values", 
+         ylab = "Average residual", 
+         ylim = c(-0.15, 0.15),
+         main = "Binned residual plot (Subset) - logit_md4", 
+         cex.pts = 0.4, 
+         col.pts = 1, 
+         col.int = "gray")
+```
+
+The binned residuals plots show that all 4 models are good fits since the means are around 0 and there are no significant patterns for the plot.
+
+#### residual-univariate plot
+
+For continous variable we make the residual-univariate plot.
+The residual should be around 0 and there should be no significant pattern.
+
+```{r echo=FALSE, cache = TRUE}
+binnedplot(x=imputed_data[subset_indices,]$age2, 
+           residuals(subset_md1, type = "response"), 
+           nclass = NULL, 
+           xlab = "age2", 
+           ylab = "Average residual", 
+           ylim = c(-0.04, 0.04),
+           main = "Binned residual plot (Subset) - logit_md1", 
+           cex.pts = 0.4, 
+           col.pts = 1, 
+           col.int = "gray")
+```
+
+```{r echo=FALSE, cache = TRUE}
+binnedplot(x=imputed_data[subset_indices,]$age2, 
+           residuals(subset_md3, type = "response"), 
+           nclass = NULL, 
+           xlab = "age2", 
+           ylab = "Average residual", 
+           ylim = c(-0.04, 0.04),
+           main = "Binned residual plot (Subset) - logit_md3", 
+           cex.pts = 0.4, 
+           col.pts = 1, 
+           col.int = "gray")
+```
+
+```{r echo=FALSE, cache = TRUE}
+binnedplot(x=imputed_data[subset_indices,]$age2, 
+           residuals(subset_md4, type = "response"), 
+           nclass = NULL, 
+           xlab = "age2", 
+           ylab = "Average residual", 
+           ylim = c(-0.04, 0.04),
+           main = "Binned residual plot (Subset) - logit_md4", 
+           cex.pts = 0.4, 
+           col.pts = 1, 
+           col.int = "gray")
+```
+
+The inclusion of splines is not changing the residual-age2 plot.
+All 3 are acceptable.
+
+For categorical variable we calculate mean residuals for each group.
+It should be around 0 and the difference between different group shouldn't be too large.
+We only take some for example.
+
+```{r echo=FALSE, cache=TRUE}
+forceDiag%>%
+  group_by(gender)%>%
+  summarise(mean_resid=mean(.deviance))
+
+forceDiag%>%
+  group_by(cs)%>%
+  summarise(mean_resid=mean(.deviance))
+```
+
+From the results we can see that only when **cs** values 9 and 10 the residual is abnormal.
+And it's because the samples with **cs**\>=9 are very little.
+
+## Model assessment
+
+### ROC curve
+
+A ROC curve is constructed by plotting the true positive rate (TPR) against the false positive rate (FPR).
+It provides a visual representation of a model's ability to distinguish between two classes.
+The AUC measures the overall performance of the classification model.
+A perfect model has an AUC of 1, while a random model has an AUC of 0.5.
+The higher the AUC, the better the model's discriminatory power.
+
+```{r echo=FALSE, cache=TRUE}
+predicted_prob <- predict(logit_md1, type = "response")
+roc_curve <- roc(response = imputed_data$force, predictor = predicted_prob)
+## Plot ROC curve
+plot(roc_curve, col = "blue", main = "ROC Curve", lwd = 2)
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)
+text(0.8, 0.2, paste("AUC =", round(auc(roc_curve), 2)), col = "blue", cex = 1.2)
+```
+
+We only show ROC curve for one model but actually we've calculate the AUC for all 4 models.The AUC for 4 models are all 0.63, which means there is no clear advantage of one model over the others in terms of Sensitivity and Specificity.
+
+### CrossValidation
+
+We alse use CrossValidation to evalue 4 models' performances.
+
+```{r echo=FALSE, cache = TRUE}
+testCV <- function(form, data, B = 1, k = 5) {
+  n <- nrow(data)
+  PEcv <- vector("list", B)
+  squared_devaince <- numeric(n)
+  for(b in 1:B) {
+    ## Generating the random division into groups
+    group <- sample(rep(1:k, length.out = n))
+    for(i in 1:k) {
+      train_data=data[group != i, ]
+      test_data=data[group == i, ]
+      modelcv <- glm(form,family = binomial(link = "logit"), data = train_data)
+      muhat <- predict(modelcv, newdata = test_data, type="response")
+      squared_devaince[group == i]<-  -2*( test_data$force * log(muhat) + (1-test_data$force) * log(1-muhat) )
+    }
+    PEcv[[b]] <- squared_devaince
+  }
+  mean(unlist(PEcv))
+}
+imputed_data$force<-as.integer(as.character(imputed_data$force))
+
+deviance1<-testCV(logit_md1, imputed_data) #1.009966727
+deviance2<-testCV(logit_md2, imputed_data) #1.009712631
+deviance3<-testCV(logit_md3, imputed_data) #1.009773304
+deviance4<-testCV(logit_md4, imputed_data) #1.009523049
+
+
+deviance_df <- data.frame(VariableName = c("deviance1", "deviance2", "deviance3", "deviance4"), Value = c(deviance1, deviance2, deviance3, deviance4))
+
+print(deviance_df)
+
+```
+
+From the results of cross validation, we can see that the prediction accuracy for these models are basically the same, while *logit_md1* has the simplest form.
+
+## Discussion and conclusion
+
+In conclusion, **logit_md1** should be the final model we choose.
+
+## Plus: interval estimation
+
+We do the interval estimation for the coefficient of *logit_md1*.
+We only take **age2** for example.
+
+```{r cache = TRUE}
+# The standard interval
+confint.default(logit_md1,"age2")
+# The likelihood interval
+confint(logit_md1,"age2")
+```
+
+```{r cache = TRUE}
+# nonparametric bootstrap
+B<- 5
+n<- nrow(imputed_data)
+beta<- numeric(B)
+for(b in 1:B){
+  i<- sample(n,n,replace=TRUE)
+  bootGlm<-glm(form1,family = binomial(link = "logit"), data = imputed_data[i,])
+  beta[b]<-coefficients(bootGlm)["age2"]
+}
+```
+
+```{r cache = TRUE}
+# parametric bootstrap
+parbeta<-numeric(B)
+d2Samp<-imputed_data
+for(b in 1:B){
+  d2Samp$force<-simulate(logit_md1)[,1]
+  bootGlm<-glm(form1,family = binomial(link = "logit"), data = d2Samp)
+  parbeta[b]<-coefficients(bootGlm)["age2"]
+}
+```
+
+```{r cache = TRUE}
+sebeta<-sd(beta)
+separbeta<-sd(parbeta)
+```
+
+```{r cache = TRUE}
+# standard error based on ordinary analytic approximations
+betahat<-coefficients(logit_md1)["age2"]
+
+# interval based on nonparametric bootstrap
+betahat+1.96*sebeta*c(-1,1)
+# interval based on parametric bootstrap
+betahat+1.96*separbeta*c(-1,1)
+```
+
+We derive 4 interval estimations for the coefficient for **age** and they are basically the same, which can also provide evidence that the model is good.
+Because if it's not, there would be a difference between the intervals derived from parametric and nonparametric bootstrapping.
